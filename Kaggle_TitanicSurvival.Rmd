@@ -1,0 +1,359 @@
+---
+title: "Kaggle: Titanic Survival"
+author: "Emma Ideal"
+date: "September 1, 2015"
+output: html_document
+---
+
+
+## Getting the Data
+I first downloaded the data from the Kaggle website, and now I read in the data:
+```{r}
+training <- read.csv('train.csv')
+testing  <- read.csv('test.csv')
+str(training)
+str(testing)
+```
+The training set contains 12 columns, while the testing set contains 11 columns - the 'Survived' outcome is not supplied in the testing set.
+
+## Imputing missing values
+It looks like there are missing values in the training set:
+```{r}
+sum(is.na(training$Age))
+sum(training$Cabin=='')
+sum(training$Embarked=='')
+```
+More than 77% of the Cabin values are missing in the training set, giving us little statistics to impute the missing data. This variable will therefore not be useful in prediction.
+
+There are 2 missing values in the Embarked column of the training set. I would like to use k-nearest-neighbors imputation to replace these missing values, but right now, I am having trouble installing the R *imputation* package. Instead, I will look at variables I expect to be correlated with Embarked such as Pclass and Fare:
+```{r}
+table(training$Embarked, training$Pclass)
+```
+The missing Embarked values are seen in the first row and first column of the table. These missing values have Pclass = 1; the majority of Pclass = 1 values fall in the 'S' Embarked category.
+```{r}
+farecut <- cut(training$Fare, breaks=c(0,40,70,80,90,120,160,200,max(training$Fare)), include.lowest=T)
+table(training$Embarked, farecut)
+```
+The missing Embarked values have Fare = 80. The majority of tickets with fares around 80 fall into category 'S' for Embarked. We will replace the missing Embarked values with Embarked = 'S'.
+```{r}
+training$Embarked[training$Embarked==''] <- 'S'
+training$Embarked <- droplevels(training$Embarked)
+```
+
+Roughly 20% of the Age values in the training set are NA. Since age will likely be a useful covariate for predicting survival, we want to impute this data somehow. We can fit a generalized linear model using the following covariates: Pclass, Sex, SibSp, Parch, Fare, and Embarked.
+```{r, message=FALSE}
+library(caret)
+training$Age[is.na(training$Age)] <- 0
+trainingNoNA <- training[training$Age != 0,]
+trainingNA <- training[training$Age == 0,]
+glm <- train(Age ~ Pclass+Sex+SibSp+Parch+Fare+Embarked, method='glm', data=trainingNoNA)
+glm$finalModel
+```
+We now use this model to predict the missing ages in the **trainingNoNA** samples:
+```{r}
+pred <- round(predict(glm, newdata=trainingNA),0)
+# Make any negative ages = 0
+pred[pred<0] <- 0
+```
+Now replace these predictions in the trainingNA dataset and row bind the NoNA dataset to this imputed data:
+```{r}
+trainingNA$Age <- pred
+training <- rbind(trainingNA, trainingNoNA)
+```
+
+## Converting the outcome to a factor variable
+I will first change the Survived variable to a factor variable, so that the predictions will take on only the values 0 or 1 as opposed to a floating value.
+```{r}
+training$Survived <- as.factor(training$Survived)
+```
+
+## Exploratory Plots
+First make a pairs plot. The first row of the plot matrix shows the relationship between the outcome (Survived) on the y-axis and the possible predictors on the x-axis.
+```{r}
+cols <- character(nrow(training))
+cols[] <- 'black'
+cols[training$Survived %in% '0'] <- 'blue'
+cols[training$Survived %in% '1'] <- 'red'
+pairs(Survived~Pclass+Sex+Age+SibSp+Parch+Fare+Embarked, data=training, cex.labels=1.3, col=cols)
+```
+
+Plot some variables:
+```{r}
+library(ggplot2)
+ggplot(training, aes(Fare, fill=Survived)) + geom_density(alpha=0.2)
+ggplot(training, aes(SibSp, fill=Survived)) + geom_density(alpha=0.2)
+ggplot(training, aes(Parch, fill=Survived)) + geom_density(alpha=0.2)
+ggplot(training[as.factor(training$Survived)=='1',], aes(x=SibSp, y=Parch)) + geom_jitter(aes(colour = Survived))
+ggplot(training[as.factor(training$Survived)=='0',], aes(x=SibSp, y=Parch)) + geom_jitter(aes(colour = Survived))
+ggplot(training, aes(x=Age, y=Fare)) + geom_point(aes(x=Age, y=Fare, colour=training$Survived))
+ggplot(training, aes(x=Fare, y=SibSp)) + geom_jitter(aes(colour=Survived))
+ggplot(training, aes(x=Fare, y=Parch)) + geom_jitter(aes(colour=Survived))
+ggplot(training, aes(Fare, y=Embarked)) + geom_jitter(aes(colour=Survived))
+```
+
+We can then plot the relationship between Survived and Age, colored by Sex:
+```{r}
+ggplot(training, aes(Age, Survived, col=Sex)) + geom_jitter()
+```
+   
+Those who survived were overwhelmingly female.
+
+## Building Prediction Models
+In order to build prediction models, we first need to divide our training set into a train and test set. The test set will be used to estimate our out-of-sample error rates for our various models.
+```{r}
+set.seed(31)
+inTrain <- createDataPartition(y=training$Survived, p=0.7, list=FALSE)
+train <- training[inTrain,]
+test  <- training[-inTrain,]
+```
+
+## Model Building: Generalized Linear Model
+```{r}
+set.seed(953)
+glmMod <- train(as.factor(Survived)~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked, method='glm', data=train)
+glmMod$finalModel
+```
+We can plot the variable importance for the model. For linear models, this is the absolute value of the t-statistics for each predictor variable.
+```{r}
+plot(varImp(glmMod))
+```
+The Sex variable is ranked first. As seen in the final model, its coefficient for Sex = Male is negative, indicating survival is more likely for women than for men (which was perhaps expected).
+
+We can then used the trained linear model to predict on the test data:
+```{r}
+predGLM <- predict(glmMod, test)
+confusionMatrix(predGLM, test$Survived)
+```
+
+## Model Building: Gradient Boosting
+```{r, message=FALSE, warning=FALSE}
+set.seed(5346)
+trCl <- trainControl(method='cv', number=4, verboseIter=FALSE, allowParallel=TRUE)
+gbmMod <- train(as.factor(Survived)~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked, method='gbm', verbose=FALSE, data=train, trControl=trCl)
+mean(gbmMod$resample$Accuracy)
+```
+Predict on the test data:
+```{r}
+predGBM <- predict(gbmMod, test)
+confusionMatrix(predGBM, test$Survived)
+```
+
+## Model Building: Random Forest
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(3576)
+rfMod <- train(as.factor(Survived)~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked, method='rf', data=train)
+rfMod$finalModel
+```
+The out-of-bag estimate of the error rate, which estimates the error rate on new unseen data is 16.8%. 
+We can use this trained random forest to predict on the testing set:
+```{r}
+predRF <- predict(rfMod, test)
+confusionMatrix(predRF, test$Survived)
+```
+The accuracy on the test set is 84.6%, or equivalently, the error rate is 15.4%.
+
+We can also take a look at the order of variable importance for the random forest model. The variable importance is computed by taking the out-of-bag samples for each tree (i.e. the samples not used in tree construction), taking a random permutation of the predictor variable value and putting these new OOB samples down each tree in the forest. The difference between the number of votes for the correct class in the variable-permuted OOB data and the number of votes in the original OOB data is the importance score for that variable. It is a measure of how sensitive the forest prediction is on the value of that particular variable.
+```{r}
+plot(varImp(rfMod))
+```
+
+## SVM
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(123)
+library(e1071)
+svmMod <- svm(as.factor(Survived)~Sex, data=train)
+
+predSVM <- predict(svmMod, test)
+confusionMatrix(predSVM, test$Survived)
+```
+
+
+
+## Making a Kaggle Submission
+First, we need to clean the testing set in the same way we treated the training set.
+```{r}
+# Note there are no missing Embarked values in the testing set
+# Impute the Age variable using the same model we used for the training
+testingNA <- testing[is.na(testing$Age),]
+testingNoNA <- testing[!is.na(testing$Age),]
+predAge <- round(predict(glm, newdata=testingNA), 0)
+predAge[predAge<0] <- 0
+testingNA$Age <- predAge
+new_testing <- rbind(testingNA, testingNoNA)
+
+# Impute the missing Fare variable in the testing set by taking the median of the Fare values
+new_testing$Fare[is.na(new_testing$Fare)] <- median(new_testing$Fare, na.rm=TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+# Train a model on the full training set
+rfmod <- train(as.factor(Survived)~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked, method='rf', data=training)
+submission <- data.frame(PassengerId=new_testing$PassengerId)
+submission$Survived <- predict(rfmod, new_testing)
+write.csv(submission, file='random_forest_r_submission1.csv', row.names=FALSE)
+```
+
+
+## Comparing results on the new_testing set: GLM, GBM, RF
+```{r}
+glmmod <- train(as.factor(Survived)~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked, method='glm', data=training)
+gbmmod <- train(as.factor(Survived)~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked, method='gbm', verbose=FALSE, data=training)
+resGLM <- predict(glmmod, new_testing)
+resGBM <- predict(gbmmod, new_testing)
+resRF <- predict(rfmod, new_testing)
+```
+
+```{r}
+add <- as.numeric(resGLM) + as.numeric(resGBM) + as.numeric(resRF) # 3 for 000, 4 for 001, 5 for 011, 6 for 111
+majority_pred <- ifelse(add < 5, '0', '1')
+
+# New Kaggle predictions based on majority vote from our 3 models
+submission <- data.frame(PassengerId=new_testing$PassengerId)
+submission$Survived <- majority_pred
+write.csv(submission, file='3modelvote_submission2.csv', row.names=FALSE)
+```
+
+
+## Combining Predictors
+```{r, message=FALSE}
+predDF <- data.frame(predRF, predGBM, predGLM, predSVM, Survived=test$Survived)
+combModFit <- train(Survived~., method='gam', data=predDF)
+combPred <- predict(combModFit, predDF)
+
+sum(predGLM==test$Survived)
+sum(predGBM==test$Survived)
+sum(predRF==test$Survived)
+sum(combPred==test$Survived)
+```
+
+
+# Trying out some Other Ideas
+## Add a variable for Child/Adult
+We will try adding a new factor variable that distinguishes children from adults. For those in the training set without an age, we will grep the name for the words "Miss" or "Master". First, let's make some exploratory plots.
+
+```{r}
+# Load the training set and select only those samples where the Age is not NA
+new_train <- read.csv('train.csv')
+new_train$Embarked[new_train$Embarked==''] <- 'S'
+new_train$Embarked <- droplevels(new_train$Embarked)
+new_trainNoNA <- new_train[!is.na(new_train$Age),]
+
+# Find those samples with Miss or Master in the name
+names <- c('Miss', 'Master')
+namesl <- grepl(paste(names, collapse='|'), new_trainNoNA$Name, ignore.case=TRUE)
+
+# Plot Survived vs. Age colored by if Miss or Master is present in the name
+ggplot(new_trainNoNA, aes(Age, Survived, col=namesl)) + geom_jitter() + ggtitle("Survived vs. Age Colored by if Miss or Master is Present in the Name")
+```
+
+This plot reveals that "Miss" and "Master" are typically indicative of children or young adults (e.g. including unmarried women).
+
+```{r}
+# Plot Sex vs. Age colored by if Miss or Master is present in the name
+ggplot(new_trainNoNA, aes(Age, Sex, col=namesl)) + geom_jitter() + ggtitle("Sex vs. Age Colored by if Miss or Master is Present in the Name")
+```
+
+The above plot shows that "Miss" is sometimes used for older women (perhaps those that are unmarried). However, "Master" seems to only be used for males below a certain age.
+
+We can now create our new variable "ChildAdult":
+```{r}
+new_trainNA <- new_train[is.na(new_train$Age),]
+
+# Create ChildAdult variable
+MissMaster <- grepl(paste(names, collapse='|'), new_trainNA$Name, ignore.case=TRUE)
+new_trainNA$ChildAdult <- ifelse(MissMaster, 'Child', 'Adult')
+new_trainNA$Age <- -1
+
+# Same for new_trainNoNA
+new_trainNoNA$ChildAdult <- ifelse(new_trainNoNA$Age < 19, 'Child', 'Adult')
+
+# Join new_trainNoNA and new_trainNA
+joined_train <- rbind(new_trainNoNA, new_trainNA)
+
+# Set Survived as a factor variable so our predictions yield 0 or 1
+joined_train$Survived <- as.factor(joined_train$Survived)
+```
+
+We can try to train a random forest with this new ChildAdult variable, but let's first divide the training set into a train and test set: 
+
+```{r}
+set.seed(731)
+inTrain <- createDataPartition(y=joined_train$Survived, p=0.7, list=FALSE)
+train <- joined_train[inTrain,]
+test <- joined_train[-inTrain,]
+```
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(8076)
+new_rf <- train(Survived~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked+ChildAdult, method='rf', data=train)
+
+# Predict on the test set
+pred <- predict(new_rf, test)
+confusionMatrix(pred, test$Survived)
+```
+
+The error rate on the test set is slightly worse than obtained with our previous random forest model.
+
+
+## Impute Age and use ChildAdult
+```{r, message=FALSE}
+train2 <- read.csv('train.csv')
+train2$Embarked[train2$Embarked==''] <- 'S'
+train2$Embarked <- droplevels(train2$Embarked)
+train2$Age[is.na(train2$Age)] <- 0
+train2NoNA <- train2[train2$Age != 0,]
+train2NA <- train2[train2$Age == 0,]
+glm <- train(Age ~ Pclass+Sex+SibSp+Parch+Fare+Embarked, method='glm', data=train2NoNA)
+```
+We now use this model to predict the missing ages in the **trainingNoNA** samples:
+```{r}
+pred <- round(predict(glm, newdata=train2NA),0)
+# Make any negative ages = 0
+pred[pred<0] <- 0
+```
+Now replace these predictions in the trainingNA dataset and row bind the NoNA dataset to this imputed data:
+```{r}
+train2NA$Age <- pred
+
+#Create ChildAdult variable
+MissMaster <- grepl(paste(names, collapse='|'), train2NA$Name, ignore.case=TRUE)
+train2NA$ChildAdult <- ifelse(MissMaster, 'Child', 'Adult')
+train2NoNA$ChildAdult <- ifelse(train2NoNA$Age < 19, 'Child', 'Adult')
+
+training2 <- rbind(train2NA, train2NoNA)
+training2$Survived <- as.factor(training2$Survived)
+```
+
+
+Divide the training2 samples into train and test sets:
+```{r}
+set.seed(111)
+inTrain <- createDataPartition(y=training2$Survived, p=0.7, list=FALSE)
+train <- training2[inTrain,]
+test <- training2[-inTrain,]
+```
+Train the random forest:
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(435)
+modrf <- train(Survived~Age+Pclass+Sex+SibSp+Parch+Fare+Embarked+ChildAdult, method='rf', data=train)
+
+pred <- predict(modrf, test)
+confusionMatrix(pred, test$Survived)
+```
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+set.seed(908)
+modimp <- train(Survived~Age+Pclass+Sex+Fare+ChildAdult+SibSp, method='rf', data=train)
+pred <- predict(modimp, test)
+confusionMatrix(pred, test$Survived)
+```
+
+## Train the SVM with ChildAdult included
+```{r}
+set.seed(4018)
+library(e1071)
+modsvm <- svm(as.factor(Survived)~Age+Sex+Pclass+Fare+ChildAdult+SibSp+Embarked, data=train) # leaving Parch OR SibSp out
+pred <- predict(modsvm, test)
+confusionMatrix(pred, test$Survived)
+```
+
